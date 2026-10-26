@@ -136,8 +136,8 @@ class SandboxSupervisor:
         """Route `trial.agent_environment`'s start and stop through this supervisor.
 
         Call after `Trial.create` and before `trial.run()`. Harbor's own calls are unchanged; they
-        now pass through the creation limit, and `stop()` waits for a pending start and runs once
-        however many callers reach it.
+        now pass through the creation limit, and `stop()` waits for a pending start. Concurrent
+        callers share cleanup; successful cleanup is cached and failed cleanup can be retried.
         """
         # `getattr`, because callers and tests pass their own trial objects; one without an agent
         # environment has no sandbox to supervise.
@@ -170,23 +170,25 @@ class SandboxSupervisor:
             await asyncio.shield(box.start_task)
 
         async def stop(delete: bool) -> None:
-            if box.stop_task is None:
+            # Share an in-flight stop and cache success, but allow failed cleanup to retry.
+            if box.stop_task is None or (
+                box.stop_task.done()
+                and (box.stop_task.cancelled() or box.stop_task.exception() is not None)
+            ):
                 box.stop_task = asyncio.ensure_future(_stop_once(delete))
             await asyncio.shield(box.stop_task)
 
         async def _stop_once(delete: bool) -> None:
-            try:
-                if box.start_task is not None:
-                    await asyncio.wait({box.start_task}, timeout=_START_GRACE_S)
-                    if not box.start_task.done():
-                        box.start_task.cancel()
-                    elif not box.start_task.cancelled():
-                        # A start failure is the trial's to report; retrieved so asyncio stays quiet.
-                        box.start_task.exception()
-                await real_stop(delete=delete)
-            finally:
-                with self._lock:
-                    self._owned.discard(box)
+            if box.start_task is not None:
+                await asyncio.wait({box.start_task}, timeout=_START_GRACE_S)
+                if not box.start_task.done():
+                    box.start_task.cancel()
+                elif not box.start_task.cancelled():
+                    # A start failure is the trial's to report; retrieved so asyncio stays quiet.
+                    box.start_task.exception()
+            await real_stop(delete=delete)
+            with self._lock:
+                self._owned.discard(box)
 
         env.start, env.stop = start, stop
         env._openenv_sandbox = box

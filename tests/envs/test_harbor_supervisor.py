@@ -349,3 +349,103 @@ def test_max_starts_comes_from_the_environment(monkeypatch):
     monkeypatch.setenv("OPENENV_HARBOR_MAX_SANDBOX_STARTS", "3")
     assert supervisor_mod.get_supervisor()._limit._limit == 3
     assert supervisor_mod.get_supervisor() is supervisor_mod.get_supervisor()
+
+
+@pytest.mark.parametrize("retry_via_close", [False, True])
+async def test_failed_stop_retains_ownership_and_can_be_retried(retry_via_close):
+    sup = SandboxSupervisor()
+    attempts = 0
+
+    class FlakyEnv(FakeEnv):
+        async def stop(self, delete: bool) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary backend failure")
+            await super().stop(delete)
+
+    log = []
+    env = FlakyEnv(log)
+    sup.adopt(make_trial(env))
+    await env.start(force_build=False)
+    with pytest.raises(RuntimeError, match="temporary backend failure"):
+        await env.stop(delete=True)
+    retained = sup.owned
+
+    if retry_via_close:
+        await sup.aclose()
+    else:
+        await env.stop(delete=True)
+    assert retained == 1
+    assert attempts == 2
+    assert sup.owned == 0
+    assert stops(log) == [("env", "stop", True)]
+    await env.stop(delete=True)
+    assert attempts == 2
+
+
+async def test_cancelled_stop_attempt_can_be_retried():
+    sup = SandboxSupervisor()
+    attempts = 0
+
+    class CancelledEnv(FakeEnv):
+        async def stop(self, delete: bool) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncio.CancelledError
+            await super().stop(delete)
+
+    env = CancelledEnv([])
+    sup.adopt(make_trial(env))
+    await env.start(force_build=False)
+    with pytest.raises(asyncio.CancelledError):
+        await env.stop(delete=True)
+    retained = sup.owned
+    await env.stop(delete=True)
+    assert retained == 1
+    assert attempts == 2
+    assert sup.owned == 0
+
+
+async def test_retry_shares_cleanup_when_a_waiter_is_cancelled():
+    sup = SandboxSupervisor()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+
+    class BlockingRetryEnv(FakeEnv):
+        async def stop(self, delete: bool) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary backend failure")
+            entered.set()
+            await release.wait()
+            await super().stop(delete)
+
+    log = []
+    env = BlockingRetryEnv(log)
+    sup.adopt(make_trial(env))
+    await env.start(force_build=False)
+    with pytest.raises(RuntimeError, match="temporary backend failure"):
+        await env.stop(delete=True)
+
+    waiter = asyncio.create_task(env.stop(delete=True))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        # Cancelling a waiter must not cancel or forget the shared cleanup.
+        assert sup.owned == 1
+        await sup.aclose(timeout=0)
+        assert attempts == 2
+        assert sup.owned == 1
+    finally:
+        release.set()
+        await asyncio.gather(waiter, return_exceptions=True)
+    await asyncio.gather(sup.aclose(), sup.aclose(), env.stop(delete=True))
+    assert attempts == 2
+    assert stops(log) == [("env", "stop", True)]
+    assert sup.owned == 0
